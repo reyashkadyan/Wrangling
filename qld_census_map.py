@@ -524,86 +524,52 @@ def _popup_html(row: pd.Series) -> str:
 
 
 def build_map(gdf: gpd.GeoDataFrame) -> folium.Map:
-    import branca.colormap as cm
-
-    m = folium.Map(location=[-22.0, 144.0], zoom_start=5,
+    m = folium.Map(location=[-22.0, 144.0], zoom_start=6,
                    tiles="CartoDB positron", prefer_canvas=True)
-
-    # Three switchable layers — one colour metric each
-    fg_irsd  = folium.FeatureGroup(name="IRSD Decile (Disadvantage) — colour", show=True)
-    fg_unemp = folium.FeatureGroup(name="Unemployment Rate % — colour", show=False)
-    fg_inc   = folium.FeatureGroup(name="Median Income $/week — colour", show=False)
-
-    unemp_vals = gdf["unemployment_rate"].dropna()
-    inc_vals   = gdf["Median_tot_prsnl_inc_weekly"].dropna()
-
-    unemp_cmap = cm.LinearColormap(
-        ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
-        vmin=unemp_vals.quantile(0.05), vmax=unemp_vals.quantile(0.95),
-        caption="Unemployment Rate (%)",
-    )
-    inc_cmap = cm.LinearColormap(
-        ["#eff3ff", "#bdd7e7", "#6baed6", "#2171b5", "#084594"],
-        vmin=inc_vals.quantile(0.05), vmax=inc_vals.quantile(0.95),
-        caption="Median Personal Income ($/week)",
-    )
 
     for _, row in gdf.iterrows():
         lat = row.geometry.centroid.y
         lon = row.geometry.centroid.x
-        popup = folium.Popup(_popup_html(row), max_width=260)
-        tip   = f"{row['POA_NAME21']} ({row['POA_CODE21']})"
 
         irsd_d = row.get("IRSD_DECILE_AUST")
-        irsd_colour = _IRSD_COLOURS.get(int(irsd_d), "#aaa") if pd.notna(irsd_d) else "#aaa"
+        colour = _IRSD_COLOURS.get(int(irsd_d), "#aaa") if pd.notna(irsd_d) else "#aaa"
 
-        unemp = row.get("unemployment_rate")
-        unemp_colour = unemp_cmap(unemp) if pd.notna(unemp) else "#aaa"
+        name = row["POA_NAME21"]
+        code = row["POA_CODE21"]
+        tip  = f"<b>{name}</b> — {code}" if name != code else f"<b>Postcode {code}</b>"
 
-        inc = row.get("Median_tot_prsnl_inc_weekly")
-        inc_colour = inc_cmap(inc) if pd.notna(inc) else "#aaa"
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=6,
+            color="white",
+            weight=0.8,
+            fill=True,
+            fill_color=colour,
+            fill_opacity=0.85,
+            popup=folium.Popup(_popup_html(row), max_width=260),
+            tooltip=tip,
+        ).add_to(m)
 
-        def _marker(colour):
-            return folium.CircleMarker(
-                location=[lat, lon],
-                radius=6,
-                color="white",
-                weight=0.8,
-                fill=True,
-                fill_color=colour,
-                fill_opacity=0.85,
-                popup=popup,
-                tooltip=tip,
-            )
-
-        _marker(irsd_colour).add_to(fg_irsd)
-        _marker(unemp_colour).add_to(fg_unemp)
-        _marker(inc_colour).add_to(fg_inc)
-
-    fg_irsd.add_to(m)
-    fg_unemp.add_to(m)
-    fg_inc.add_to(m)
-    unemp_cmap.add_to(m)
-    inc_cmap.add_to(m)
-
-    # IRSD legend (manual, since branca LinearColormap needs numeric input)
+    # IRSD decile legend
     legend_html = (
         '<div style="position:fixed;bottom:30px;left:30px;z-index:1000;'
         'background:white;padding:10px 14px;border-radius:6px;'
-        'border:1px solid #ccc;font-family:Arial,sans-serif;font-size:12px">'
-        '<b>IRSD Decile</b><br>'
-        '<span style="color:#888;font-size:10px">1 = Most disadvantaged</span><br>'
+        'border:1px solid #ccc;font-family:Arial,sans-serif;font-size:12px;'
+        'box-shadow:0 2px 6px rgba(0,0,0,.15)">'
+        '<div style="font-weight:bold;margin-bottom:4px">IRSD Decile</div>'
+        '<div style="color:#888;font-size:10px;margin-bottom:6px">'
+        '1 = Most disadvantaged · 10 = Least</div>'
     )
     for d, c in sorted(_IRSD_COLOURS.items()):
         legend_html += (
-            f'<span style="display:inline-block;width:16px;height:16px;'
-            f'background:{c};border-radius:50%;margin:2px 4px 0 0;vertical-align:middle"></span>'
-            f'Decile {d}<br>'
+            f'<div style="display:flex;align-items:center;margin-bottom:3px">'
+            f'<span style="width:14px;height:14px;border-radius:50%;background:{c};'
+            f'display:inline-block;margin-right:6px;border:1px solid rgba(0,0,0,.15)"></span>'
+            f'Decile {d}</div>'
         )
     legend_html += '</div>'
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
