@@ -1,472 +1,477 @@
 """
 QLD Census 2021 Postcode Map
-Loads the local ABS SEIFA 2021 Excel (Postal Area level), generates synthetic
-boundaries and employment data where not available, and renders an interactive
-HTML choropleth for Queensland.
+Uses locally-uploaded ABS data:
+  - Postal Area, Indexes, SEIFA 2021.xlsx    (SEIFA scores)
+  - 2021_GCP_POA_for_QLD_short-header.zip   (employment & income DataPack)
+  - POA_2021_AUST_GDA2020.dbf               (POA codes, names, areas)
 
-With full internet access to abs.gov.au the script can also download the POA
-boundary shapefile and Census DataPack for real employment figures:
-    python qld_census_map.py            # tries real downloads, falls back gracefully
-    python qld_census_map.py --demo     # pure synthetic, skips SEIFA file too
+Polygon geometry is approximated from AREASQKM21 + postcode-centroid lookup
+because the .shp was too large to upload. All data values are real ABS figures.
 """
 
-import argparse
 import fnmatch
 import sys
 import time
 import zipfile
 from pathlib import Path
+from math import sqrt
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import folium
-import requests
 from shapely.geometry import box
 
 # ---------------------------------------------------------------------------
-# Paths
+# File paths
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).parent
-DATA_DIR = REPO_ROOT / "data"
-SEIFA_DIR = DATA_DIR / "seifa"
-BOUNDARY_DIR = DATA_DIR / "boundaries"
-DATAPACK_DIR = DATA_DIR / "datapack"
-OUTPUT_HTML = REPO_ROOT / "qld_census_map.html"
+ROOT = Path(__file__).parent
 
-# Local SEIFA file uploaded by user
-LOCAL_SEIFA = REPO_ROOT / "Postal Area, Indexes, SEIFA 2021.xlsx"
+SEIFA_XLSX   = ROOT / "Postal Area, Indexes, SEIFA 2021.xlsx"
+DATAPACK_ZIP = ROOT / "2021_GCP_POA_for_QLD_short-header.zip"
+DBF_PATH     = ROOT / "POA_2021_AUST_GDA2020.dbf"
+OUTPUT_HTML  = ROOT / "qld_census_map.html"
 
-BOUNDARY_URL = (
-    "https://www.abs.gov.au/statistics/standards/"
-    "australian-statistical-geography-standard-asgs-edition-3/"
-    "jul2021-jun2026/access-and-downloads/digital-boundary-files/"
-    "POA_2021_AUST_SHP_GDA2020.zip"
-)
-DATAPACK_URL = (
-    "https://www.abs.gov.au/census/find-census-data/datapacks/download/"
-    "2021_GCP_POA_for_QLD_short-header.zip"
-)
+QLD_RE = r"^4\d{3}$"
 
-# Table 1 in the Postal Area SEIFA Excel has this column layout (skiprows=5):
-#   POA code | IRSD score | IRSD decile | IRSAD score | IRSAD decile |
-#   IER score | IER decile | IEO score | IEO decile |
-#   Usual resident pop | data-caution flag | crosses-boundary flag
+# ---------------------------------------------------------------------------
+# Column schema for SEIFA Table 1 (skiprows=5, header=None)
+# ---------------------------------------------------------------------------
+
 SEIFA_COLS = [
     "POA_CODE_2021",
-    "IRSD_SCORE",   "IRSD_DECILE_AUST",
-    "IRSAD_SCORE",  "IRSAD_DECILE_AUST",
-    "IER_SCORE",    "IER_DECILE_AUST",
-    "IEO_SCORE",    "IEO_DECILE_AUST",
+    "IRSD_SCORE",  "IRSD_DECILE_AUST",
+    "IRSAD_SCORE", "IRSAD_DECILE_AUST",
+    "IER_SCORE",   "IER_DECILE_AUST",
+    "IEO_SCORE",   "IEO_DECILE_AUST",
     "USUAL_RESIDENT_POP",
     "_DATA_CAUTION", "_POA_CROSSES",
 ]
 
-QLD_POSTCODE_RE = r"^4\d{3}$"
+# ---------------------------------------------------------------------------
+# Map layer config
+# ---------------------------------------------------------------------------
+
+LAYERS = [
+    dict(name="IRSD Decile (Socio-economic Disadvantage)",
+         col="IRSD_DECILE_AUST", palette="RdYlGn",
+         legend="IRSD Decile (1 = Most Disadvantaged, 10 = Least)", show=True),
+    dict(name="Unemployment Rate (%)",
+         col="unemployment_rate", palette="YlOrRd",
+         legend="Unemployment Rate (%)", show=False),
+    dict(name="Median Personal Income ($/week)",
+         col="Median_tot_prsnl_inc_weekly", palette="Blues",
+         legend="Median Personal Income ($/week)", show=False),
+]
 
 TOOLTIP_FIELDS = [
     "POA_CODE21", "POA_NAME21",
     "IRSD_DECILE_AUST", "IRSAD_DECILE_AUST",
-    "unemployment_rate",
-    "Median_tot_prsnl_inc_weekly",
-    "Median_age_persons",
-    "USUAL_RESIDENT_POP",
-    "AREASQKM21",
+    "unemployment_rate", "Median_tot_prsnl_inc_weekly",
+    "Median_age_persons", "USUAL_RESIDENT_POP", "AREASQKM21",
 ]
 TOOLTIP_ALIASES = [
-    "Postcode:", "Area Name:",
+    "Postcode:", "Suburb:",
     "IRSD Decile:", "IRSAD Decile:",
-    "Unemployment %:",
-    "Median Income ($/wk):",
-    "Median Age:",
-    "Population:",
-    "Area (km²):",
+    "Unemployment %:", "Median Income ($/wk):",
+    "Median Age:", "Population:", "Area (km²):",
 ]
 
-LAYERS = [
-    {
-        "name": "IRSD Decile (Socio-economic Disadvantage)",
-        "col": "IRSD_DECILE_AUST",
-        "palette": "RdYlGn",
-        "legend": "IRSD Decile (1 = Most Disadvantaged, 10 = Least)",
-        "show": True,
-    },
-    {
-        "name": "Unemployment Rate (%)",
-        "col": "unemployment_rate",
-        "palette": "YlOrRd",
-        "legend": "Unemployment Rate (%)",
-        "show": False,
-    },
-    {
-        "name": "Median Personal Income ($/week)",
-        "col": "Median_tot_prsnl_inc_weekly",
-        "palette": "Blues",
-        "legend": "Median Personal Income ($/week)",
-        "show": False,
-    },
-]
+# ---------------------------------------------------------------------------
+# Postcode centroid lookup  (lat, lon)
+# For postcodes not listed, centroids are estimated from band model below.
+# ---------------------------------------------------------------------------
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-AU,en;q=0.9",
-    "Referer": "https://www.abs.gov.au/",
+_KNOWN = {
+    "4000": (-27.470, 153.025), "4001": (-27.468, 153.027),
+    "4005": (-27.463, 153.042), "4006": (-27.455, 153.032),
+    "4007": (-27.438, 153.060), "4008": (-27.435, 153.115),
+    "4009": (-27.437, 153.098), "4010": (-27.440, 153.072),
+    "4011": (-27.417, 153.072), "4012": (-27.402, 153.073),
+    "4013": (-27.397, 153.072), "4014": (-27.380, 153.078),
+    "4017": (-27.300, 153.052), "4018": (-27.318, 153.070),
+    "4019": (-27.267, 153.075), "4020": (-27.230, 153.102),
+    "4021": (-27.212, 153.088), "4025": (-27.058, 153.175),
+    "4029": (-27.450, 153.018), "4030": (-27.420, 153.018),
+    "4031": (-27.400, 153.010), "4032": (-27.385, 153.005),
+    "4034": (-27.360, 153.028), "4035": (-27.345, 152.982),
+    "4036": (-27.343, 153.058), "4037": (-27.353, 153.050),
+    "4051": (-27.423, 152.988), "4053": (-27.402, 152.988),
+    "4054": (-27.392, 152.973), "4055": (-27.415, 152.955),
+    "4059": (-27.450, 152.990), "4060": (-27.460, 153.000),
+    "4061": (-27.472, 152.970), "4064": (-27.470, 152.998),
+    "4065": (-27.480, 152.982), "4066": (-27.472, 152.975),
+    "4067": (-27.502, 153.002), "4068": (-27.510, 152.990),
+    "4069": (-27.507, 152.940), "4070": (-27.510, 152.900),
+    "4073": (-27.547, 152.968), "4074": (-27.556, 152.941),
+    "4075": (-27.543, 152.965), "4076": (-27.555, 152.934),
+    "4077": (-27.566, 152.979), "4078": (-27.570, 152.980),
+    "4101": (-27.482, 153.018), "4102": (-27.493, 153.033),
+    "4103": (-27.508, 153.025), "4104": (-27.512, 153.012),
+    "4105": (-27.534, 153.008), "4106": (-27.552, 153.020),
+    "4107": (-27.550, 153.030), "4108": (-27.563, 153.048),
+    "4109": (-27.572, 153.051), "4110": (-27.590, 153.050),
+    "4111": (-27.540, 153.010), "4112": (-27.598, 153.078),
+    "4113": (-27.578, 153.093), "4114": (-27.638, 153.107),
+    "4115": (-27.641, 153.132), "4116": (-27.572, 153.092),
+    "4117": (-27.601, 153.071), "4118": (-27.612, 153.051),
+    "4119": (-27.623, 153.073), "4120": (-27.495, 153.044),
+    "4121": (-27.504, 153.053), "4122": (-27.542, 153.067),
+    "4123": (-27.499, 153.088), "4124": (-27.618, 153.167),
+    "4125": (-27.648, 153.131), "4127": (-27.608, 153.151),
+    "4128": (-27.618, 153.003), "4129": (-27.593, 152.978),
+    "4130": (-27.443, 153.162), "4131": (-27.450, 153.138),
+    "4132": (-27.455, 153.128), "4133": (-27.493, 153.133),
+    "4151": (-27.493, 153.055), "4152": (-27.491, 153.063),
+    "4153": (-27.522, 153.197), "4154": (-27.460, 153.183),
+    "4155": (-27.467, 153.192), "4156": (-27.520, 153.162),
+    "4157": (-27.493, 153.218), "4158": (-27.471, 153.243),
+    "4159": (-27.539, 153.263), "4160": (-27.526, 153.278),
+    "4161": (-27.523, 153.228), "4163": (-27.582, 153.299),
+    "4164": (-27.688, 153.262), "4165": (-27.607, 153.304),
+    "4169": (-27.483, 153.040), "4170": (-27.473, 153.103),
+    "4171": (-27.468, 153.082), "4172": (-27.462, 153.112),
+    "4173": (-27.492, 153.127), "4174": (-27.472, 153.132),
+    "4178": (-27.455, 153.148), "4179": (-27.434, 153.148),
+    "4205": (-27.713, 153.198), "4207": (-27.874, 153.298),
+    "4208": (-27.829, 153.278), "4209": (-27.770, 153.272),
+    "4210": (-27.932, 153.352), "4211": (-27.980, 153.352),
+    "4212": (-27.903, 153.402), "4213": (-28.073, 153.369),
+    "4214": (-28.003, 153.380), "4215": (-27.960, 153.388),
+    "4216": (-28.003, 153.430), "4217": (-28.030, 153.428),
+    "4218": (-28.052, 153.442), "4219": (-28.073, 153.442),
+    "4220": (-28.092, 153.450), "4221": (-28.118, 153.468),
+    "4223": (-28.162, 153.491), "4224": (-28.169, 153.540),
+    "4225": (-28.143, 153.491), "4226": (-28.067, 153.392),
+    "4227": (-28.075, 153.408), "4228": (-28.093, 153.408),
+    "4229": (-28.088, 153.418), "4270": (-28.034, 153.192),
+    "4280": (-27.790, 153.017), "4285": (-27.900, 152.878),
+    "4300": (-27.660, 152.920), "4301": (-27.598, 152.897),
+    "4303": (-27.610, 152.772), "4304": (-27.618, 152.782),
+    "4305": (-27.629, 152.808), "4306": (-27.237, 152.422),
+    "4307": (-27.727, 152.538), "4309": (-28.079, 152.643),
+    "4310": (-27.890, 152.578), "4311": (-27.110, 152.322),
+    "4312": (-27.016, 152.598), "4313": (-27.480, 152.433),
+    "4340": (-27.622, 152.567), "4341": (-27.652, 152.393),
+    "4342": (-27.490, 152.302), "4343": (-27.555, 152.227),
+    "4344": (-27.413, 152.188), "4345": (-27.478, 152.053),
+    "4346": (-27.358, 151.870), "4347": (-27.293, 152.037),
+    "4350": (-27.550, 151.952), "4351": (-27.540, 151.960),
+    "4352": (-27.459, 151.955), "4353": (-27.258, 151.978),
+    "4354": (-27.118, 151.958), "4355": (-27.348, 151.678),
+    "4356": (-27.430, 151.822), "4357": (-27.612, 151.595),
+    "4358": (-27.503, 151.603), "4359": (-27.676, 151.810),
+    "4360": (-28.133, 151.965), "4361": (-28.132, 152.027),
+    "4362": (-28.227, 151.885), "4365": (-28.025, 151.815),
+    "4370": (-28.213, 152.037), "4371": (-28.298, 151.892),
+    "4372": (-28.162, 152.117), "4373": (-28.307, 152.167),
+    "4374": (-28.538, 151.785), "4375": (-28.350, 151.663),
+    "4376": (-28.580, 151.553), "4377": (-28.628, 151.460),
+    "4378": (-28.758, 151.563), "4380": (-29.065, 151.848),
+    "4381": (-28.878, 151.687), "4382": (-28.660, 151.928),
+    "4383": (-28.833, 151.878), "4384": (-28.952, 151.730),
+    "4385": (-28.672, 151.133), "4386": (-28.752, 150.708),
+    "4387": (-28.592, 150.413), "4388": (-28.755, 150.122),
+    "4390": (-28.550, 150.310), "4400": (-27.183, 151.263),
+    "4401": (-27.017, 151.393), "4402": (-26.797, 151.278),
+    "4403": (-27.062, 151.093), "4404": (-26.902, 151.025),
+    "4405": (-26.659, 150.183), "4406": (-26.527, 150.090),
+    "4407": (-26.340, 150.305), "4408": (-26.220, 149.803),
+    "4409": (-26.153, 149.413), "4410": (-26.571, 148.793),
+    "4411": (-26.705, 149.178), "4412": (-26.617, 148.188),
+    "4413": (-26.980, 148.803), "4415": (-27.157, 149.063),
+    "4416": (-27.392, 149.203), "4417": (-27.608, 149.532),
+    "4418": (-27.817, 150.223), "4419": (-27.930, 149.947),
+    "4420": (-28.068, 145.681), "4421": (-27.712, 146.298),
+    "4422": (-27.432, 146.793), "4423": (-27.230, 147.343),
+    "4424": (-26.867, 147.653), "4425": (-26.575, 147.893),
+    "4426": (-26.225, 147.363), "4427": (-25.982, 147.073),
+    "4428": (-26.448, 148.332), "4454": (-25.750, 148.953),
+    "4455": (-25.513, 149.198), "4461": (-25.170, 149.283),
+    "4462": (-24.863, 149.583), "4465": (-24.517, 150.153),
+    "4467": (-24.833, 148.733), "4468": (-23.883, 148.600),
+    "4470": (-23.432, 147.353), "4471": (-23.017, 147.883),
+    "4472": (-22.803, 148.083), "4474": (-22.478, 147.978),
+    "4475": (-22.325, 147.533), "4477": (-23.600, 148.367),
+    "4478": (-24.467, 148.067), "4480": (-26.133, 145.733),
+    "4481": (-25.233, 144.400), "4482": (-24.017, 143.633),
+    "4483": (-23.467, 143.267), "4486": (-27.233, 144.633),
+    "4487": (-27.750, 143.833), "4488": (-28.883, 145.683),
+    "4489": (-28.717, 144.483), "4490": (-28.517, 143.517),
+    "4491": (-29.833, 142.833), "4492": (-27.633, 142.383),
+    "4493": (-27.867, 143.267), "4494": (-26.417, 143.450),
+    "4496": (-25.250, 143.433), "4497": (-24.400, 143.833),
+    "4498": (-23.217, 143.100), "4499": (-22.033, 143.217),
+    "4500": (-27.312, 153.042), "4501": (-27.293, 153.040),
+    "4502": (-27.270, 153.010), "4503": (-27.272, 153.023),
+    "4504": (-27.170, 153.003), "4505": (-27.074, 153.012),
+    "4506": (-27.112, 152.998), "4507": (-27.040, 153.163),
+    "4508": (-27.202, 153.000), "4509": (-27.242, 153.020),
+    "4510": (-26.958, 152.780), "4511": (-26.877, 153.052),
+    "4512": (-26.967, 152.897), "4514": (-26.953, 152.567),
+    "4515": (-26.843, 152.583), "4516": (-26.902, 152.783),
+    "4517": (-26.788, 152.933), "4519": (-26.937, 153.023),
+    "4520": (-27.350, 152.920), "4521": (-27.217, 152.867),
+    "4550": (-26.753, 152.853), "4551": (-26.800, 153.130),
+    "4552": (-26.862, 153.000), "4553": (-26.912, 152.940),
+    "4554": (-26.812, 152.962), "4555": (-26.628, 152.959),
+    "4556": (-26.680, 153.062), "4557": (-26.660, 153.100),
+    "4558": (-26.397, 153.041), "4559": (-26.692, 152.963),
+    "4560": (-26.452, 152.907), "4561": (-26.402, 153.031),
+    "4562": (-26.492, 153.112), "4563": (-26.492, 152.953),
+    "4564": (-26.588, 153.112), "4565": (-26.383, 152.863),
+    "4566": (-26.358, 153.043), "4567": (-26.391, 153.098),
+    "4568": (-26.442, 153.002), "4570": (-26.190, 152.667),
+    "4571": (-25.912, 153.093), "4572": (-26.692, 153.072),
+    "4573": (-26.618, 153.098), "4574": (-26.538, 152.978),
+    "4575": (-26.722, 153.090), "4576": (-26.732, 153.082),
+    "4577": (-26.338, 153.122), "4578": (-25.798, 152.898),
+    "4580": (-25.540, 152.700), "4581": (-25.278, 152.838),
+    "4600": (-26.358, 152.258), "4601": (-26.228, 151.993),
+    "4605": (-26.483, 152.033), "4606": (-26.613, 151.928),
+    "4608": (-26.383, 151.753), "4610": (-26.738, 151.793),
+    "4611": (-26.600, 151.610), "4612": (-26.217, 151.433),
+    "4613": (-25.943, 151.268), "4614": (-25.883, 151.613),
+    "4620": (-25.618, 151.878), "4621": (-25.398, 151.698),
+    "4625": (-25.533, 151.448), "4626": (-25.783, 151.133),
+    "4627": (-25.383, 151.033), "4628": (-25.168, 151.338),
+    "4630": (-25.233, 152.033), "4650": (-25.540, 152.700),
+    "4655": (-25.290, 152.840), "4659": (-25.108, 152.568),
+    "4660": (-24.783, 152.283), "4662": (-25.200, 152.308),
+    "4670": (-24.870, 152.350), "4671": (-24.958, 152.358),
+    "4673": (-24.833, 152.183), "4674": (-24.963, 151.918),
+    "4676": (-24.428, 151.828), "4677": (-24.433, 152.053),
+    "4678": (-24.317, 151.963), "4680": (-23.840, 151.260),
+    "4694": (-23.742, 150.688), "4695": (-23.533, 150.838),
+    "4697": (-23.233, 150.733), "4699": (-23.133, 150.783),
+    "4700": (-23.380, 150.510), "4701": (-23.524, 148.168),
+    "4702": (-24.108, 148.090), "4703": (-23.133, 150.743),
+    "4704": (-23.238, 150.558), "4706": (-22.832, 150.253),
+    "4707": (-22.483, 150.033), "4709": (-22.953, 148.733),
+    "4710": (-23.183, 150.303), "4711": (-23.133, 150.433),
+    "4712": (-23.683, 149.883), "4714": (-24.117, 149.633),
+    "4715": (-24.583, 149.133), "4716": (-24.467, 148.683),
+    "4717": (-24.100, 148.433), "4718": (-24.700, 148.033),
+    "4719": (-24.367, 147.983), "4720": (-23.440, 144.252),
+    "4721": (-23.558, 145.290), "4722": (-24.150, 146.267),
+    "4723": (-22.983, 145.650), "4724": (-22.667, 144.667),
+    "4725": (-22.083, 144.983), "4726": (-21.700, 144.550),
+    "4727": (-21.483, 143.967), "4728": (-21.583, 143.467),
+    "4730": (-26.402, 146.242), "4731": (-26.613, 144.260),
+    "4732": (-26.183, 145.567), "4733": (-25.833, 146.017),
+    "4735": (-25.050, 145.900), "4736": (-25.717, 144.833),
+    "4737": (-24.600, 145.250), "4738": (-24.267, 144.767),
+    "4739": (-24.267, 146.167), "4740": (-21.150, 149.190),
+    "4741": (-20.402, 148.578), "4742": (-21.550, 148.433),
+    "4743": (-21.167, 148.033), "4744": (-21.383, 147.883),
+    "4745": (-21.017, 147.733), "4746": (-20.650, 147.483),
+    "4747": (-20.533, 147.850), "4750": (-21.425, 149.221),
+    "4751": (-22.003, 148.050), "4752": (-22.583, 149.483),
+    "4753": (-21.917, 149.350), "4754": (-21.667, 148.983),
+    "4756": (-21.217, 148.783), "4757": (-20.867, 148.500),
+    "4798": (-20.400, 148.533), "4799": (-20.058, 148.133),
+    "4800": (-20.012, 148.243), "4801": (-19.750, 148.433),
+    "4802": (-20.292, 148.703), "4803": (-19.983, 148.367),
+    "4804": (-19.700, 147.833), "4805": (-19.367, 147.433),
+    "4806": (-19.133, 147.033), "4807": (-18.850, 146.633),
+    "4808": (-18.567, 146.233), "4809": (-18.283, 146.033),
+    "4810": (-19.260, 146.820), "4811": (-19.322, 146.751),
+    "4812": (-19.283, 146.620), "4813": (-19.317, 146.783),
+    "4814": (-19.307, 146.788), "4815": (-19.330, 146.763),
+    "4816": (-18.983, 146.167), "4817": (-19.284, 146.764),
+    "4818": (-19.263, 146.772), "4819": (-19.139, 146.872),
+    "4820": (-20.074, 146.263), "4821": (-20.900, 145.450),
+    "4822": (-21.317, 144.700), "4823": (-20.933, 143.900),
+    "4824": (-20.783, 140.983), "4825": (-20.730, 139.492),
+    "4826": (-20.150, 138.350), "4827": (-19.750, 139.467),
+    "4828": (-19.383, 139.617), "4829": (-23.067, 141.900),
+    "4830": (-20.710, 140.512), "4849": (-19.517, 140.033),
+    "4850": (-18.650, 146.160), "4852": (-18.250, 145.950),
+    "4854": (-17.967, 145.917), "4855": (-17.733, 146.017),
+    "4856": (-17.483, 145.883), "4858": (-17.233, 145.750),
+    "4859": (-17.750, 146.033), "4860": (-18.258, 146.018),
+    "4861": (-18.583, 145.917), "4865": (-17.607, 145.483),
+    "4868": (-17.133, 145.533), "4869": (-17.523, 146.028),
+    "4870": (-16.920, 145.770), "4871": (-16.017, 144.700),
+    "4872": (-17.267, 145.477), "4873": (-16.462, 145.372),
+    "4874": (-15.468, 145.249), "4875": (-12.661, 141.863),
+    "4876": (-10.887, 142.400), "4877": (-16.883, 145.617),
+    "4878": (-16.767, 145.650), "4879": (-16.533, 145.467),
+    "4880": (-17.001, 145.428), "4881": (-16.700, 145.433),
+    "4882": (-17.233, 145.600), "4883": (-17.358, 145.592),
+    "4884": (-17.533, 145.717), "4885": (-17.283, 145.592),
+    "4886": (-17.783, 145.950), "4887": (-17.633, 145.533),
+    "4888": (-17.133, 144.950), "4890": (-17.678, 141.078),
+    "4891": (-17.350, 141.317), "4892": (-13.800, 142.217),
+    "4895": (-17.490, 140.843),
 }
 
-# ---------------------------------------------------------------------------
-# Download helper
-# ---------------------------------------------------------------------------
 
-def download_file(url: str, dest: Path, timeout: int = 300) -> Path:
-    if dest.exists() and dest.stat().st_size > 0:
-        print(f"  [cache] {dest.name}")
-        return dest
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    print(f"  [download] {dest.name} ...")
-    try:
-        resp = requests.get(url, stream=True, timeout=timeout, headers=_HEADERS)
-        if resp.status_code != 200:
-            raise RuntimeError(f"HTTP {resp.status_code} from {url}")
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=8192):
-                fh.write(chunk)
-    except Exception as exc:
-        if dest.exists():
-            dest.unlink()
-        raise RuntimeError(f"Download failed: {exc}") from exc
-    print(f"  [done] {dest.stat().st_size / 1e6:.1f} MB")
-    return dest
+# Band-based fallback for postcodes not in the lookup
+# (min_n, max_n, lat_c, lon_c, lat_spread, lon_spread)
+_BANDS = [
+    (4000, 4100, -27.47, 153.02, 0.15, 0.15),
+    (4100, 4200, -27.54, 153.10, 0.15, 0.18),
+    (4200, 4300, -27.88, 153.28, 0.25, 0.22),
+    (4300, 4356, -27.63, 152.82, 0.12, 0.12),
+    (4356, 4500, -27.90, 151.20, 0.80, 1.20),
+    (4500, 4550, -27.18, 153.02, 0.15, 0.12),
+    (4550, 4600, -26.60, 153.00, 0.25, 0.18),
+    (4600, 4660, -25.70, 152.55, 0.45, 0.30),
+    (4660, 4700, -24.90, 152.10, 0.40, 0.25),
+    (4700, 4750, -23.40, 150.10, 0.60, 0.80),
+    (4750, 4810, -21.40, 148.90, 0.70, 0.60),
+    (4810, 4820, -19.30, 146.75, 0.08, 0.08),
+    (4820, 4850, -20.50, 143.50, 1.50, 2.50),
+    (4850, 4870, -18.20, 145.80, 0.80, 0.40),
+    (4870, 4896, -15.80, 145.00, 2.20, 1.20),
+    (4896, 5000, -13.50, 142.50, 2.50, 1.50),
+]
 
 
+def _centroid(poa: str) -> tuple[float, float]:
+    if poa in _KNOWN:
+        return _KNOWN[poa]
+    n = int(poa)
+    rng = np.random.default_rng(n)
+    for lo, hi, lat_c, lon_c, lat_s, lon_s in _BANDS:
+        if lo <= n < hi:
+            lat = lat_c + float(rng.uniform(-lat_s * 0.5, lat_s * 0.5))
+            lon = lon_c + float(rng.uniform(-lon_s * 0.5, lon_s * 0.5))
+            return lat, lon
+    return -25.0, 147.0   # fallback centre of QLD
+
+
+def _half_size(area_km2: float) -> float:
+    """Convert AREASQKM21 to rectangle half-size in degrees (capped for display)."""
+    # area ≈ (2h_lon * 111) * (2h_lat * 111) where h_lat ≈ h_lon * 0.7
+    # => area ≈ 4 * h² * 0.7 * 111² = h² * 34560
+    h = sqrt(max(area_km2, 1.0) / 34560.0)
+    return float(np.clip(h, 0.008, 1.8))
+
+
 # ---------------------------------------------------------------------------
-# SEIFA loader  (reads the local Postal Area Excel)
+# Data loaders
 # ---------------------------------------------------------------------------
 
-def load_seifa(excel_path: Path) -> pd.DataFrame:
-    """
-    Read Table 1 from the ABS Postal Area SEIFA 2021 workbook.
-    Data begins at row index 5 (after 3 title rows + 2 sub-header rows).
-    """
+def load_seifa() -> pd.DataFrame:
+    print(f"Loading SEIFA: {SEIFA_XLSX.name}")
     df = pd.read_excel(
-        excel_path,
+        SEIFA_XLSX,
         sheet_name="Table 1",
         skiprows=5,
         header=None,
         names=SEIFA_COLS,
         dtype={"POA_CODE_2021": str},
     )
-
-    # Drop footer / blank rows (non-numeric POA codes, e.g. "Source:", NaN)
     df = df.dropna(subset=["POA_CODE_2021"]).copy()
     df["POA_CODE_2021"] = df["POA_CODE_2021"].astype(str).str.strip()
     df = df[df["POA_CODE_2021"].str.match(r"^\d{4}$", na=False)]
-
-    numeric_cols = [c for c in SEIFA_COLS if c not in ("POA_CODE_2021", "_DATA_CAUTION", "_POA_CROSSES")]
-    for col in numeric_cols:
+    for col in SEIFA_COLS[1:-2]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
+    df = df[df["POA_CODE_2021"].str.match(QLD_RE, na=False)].copy()
+    print(f"  {len(df)} QLD postcodes")
     return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# DataPack extraction
-# ---------------------------------------------------------------------------
-
-def extract_datapack_csvs(zip_path: Path, dest_dir: Path) -> tuple[Path, Path]:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    def _find(pattern: str) -> Path | None:
-        matches = list(dest_dir.rglob(pattern))
-        return matches[0] if matches else None
-
-    g17a = _find("*G17A_QLD_POA.csv")
-    g02 = _find("*G02_QLD_POA.csv")
-    if g17a and g02:
-        print("  [cache] DataPack CSVs already extracted")
-        return g17a, g02
-
-    print("  [extract] Scanning DataPack ZIP ...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
+def load_datapack() -> tuple[pd.DataFrame, pd.DataFrame]:
+    print(f"Loading DataPack: {DATAPACK_ZIP.name}")
+    with zipfile.ZipFile(DATAPACK_ZIP) as zf:
         names = zf.namelist()
-        g17a_e = next((n for n in names if fnmatch.fnmatch(n, "*G17A_QLD_POA.csv")), None)
-        g02_e = next((n for n in names if fnmatch.fnmatch(n, "*G02_QLD_POA.csv")), None)
-        if not g17a_e or not g02_e:
-            raise FileNotFoundError(f"Required CSVs not found. Sample names: {names[:10]}")
-        zf.extract(g17a_e, dest_dir)
-        zf.extract(g02_e, dest_dir)
+        g43_e = next(n for n in names if fnmatch.fnmatch(n, "*G43_QLD_POA.csv"))
+        g02_e = next(n for n in names if fnmatch.fnmatch(n, "*G02_QLD_POA.csv"))
+        with zf.open(g43_e) as f:
+            g43 = pd.read_csv(f, dtype={"POA_CODE_2021": str})
+        with zf.open(g02_e) as f:
+            g02 = pd.read_csv(f, dtype={"POA_CODE_2021": str})
 
-    return list(dest_dir.rglob("*G17A_QLD_POA.csv"))[0], list(dest_dir.rglob("*G02_QLD_POA.csv"))[0]
+    for df in (g43, g02):
+        df["POA_CODE_2021"] = df["POA_CODE_2021"].str.replace(r"^POA", "", regex=True).str.strip()
 
+    # G43: labour force status — ABS pre-calculates unemployment rate
+    g43 = g43.rename(columns={
+        "lfs_Tot_LF_P":                 "P_LF_Tot",
+        "lfs_Unmplyed_lookng_for_wrk_P": "P_Unemp_Tot",
+        "Percent_Unem_loyment_P":        "unemployment_rate",
+    })
+    df_lf = g43[["POA_CODE_2021", "P_LF_Tot", "P_Unemp_Tot", "unemployment_rate"]].copy()
+    df_lf["unemployment_rate"] = pd.to_numeric(df_lf["unemployment_rate"], errors="coerce").round(1)
 
-def load_labour_force(g17a_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(g17a_path, dtype={"POA_CODE_2021": str})
-    df["POA_CODE_2021"] = df["POA_CODE_2021"].str.replace(r"^POA", "", regex=True).str.strip()
-    lf = next((c for c in df.columns if "LF_Tot" in c and c.startswith("P_")), None)
-    un = next((c for c in df.columns if "Unemp_Tot" in c and c.startswith("P_")), None)
-    if lf and un:
-        df = df.rename(columns={lf: "P_LF_Tot", un: "P_Unemp_Tot"})
-        df["unemployment_rate"] = np.where(
-            df["P_LF_Tot"] > 0,
-            (df["P_Unemp_Tot"] / df["P_LF_Tot"] * 100).round(1),
-            np.nan,
-        )
-    else:
-        df["P_LF_Tot"] = df["P_Unemp_Tot"] = df["unemployment_rate"] = np.nan
-    return df[["POA_CODE_2021", "P_LF_Tot", "P_Unemp_Tot", "unemployment_rate"]]
-
-
-def load_medians(g02_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(g02_path, dtype={"POA_CODE_2021": str})
-    df["POA_CODE_2021"] = df["POA_CODE_2021"].str.replace(r"^POA", "", regex=True).str.strip()
     want = ["POA_CODE_2021", "Median_age_persons", "Median_tot_prsnl_inc_weekly",
             "Median_rent_weekly", "Median_tot_hhd_inc_weekly", "Average_household_size"]
-    return df[[c for c in want if c in df.columns]]
+    df_med = g02[[c for c in want if c in g02.columns]]
+    print(f"  Labour force rows: {len(df_lf)}  |  Medians rows: {len(df_med)}")
+    return df_lf, df_med
 
 
-# ---------------------------------------------------------------------------
-# Boundary loader
-# ---------------------------------------------------------------------------
+def build_boundaries(df_seifa: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Build approximate rectangular polygons from DBF area data + centroid lookup."""
+    print("Building boundaries from DBF + centroid lookup …")
 
-def load_boundaries(zip_path: Path, extract_dir: Path) -> gpd.GeoDataFrame:
-    shp = extract_dir / "POA_2021_AUST_GDA2020.shp"
-    if not shp.exists():
-        print("  [extract] Extracting boundary shapefile ...")
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+    # Read attribute table (no geometry)
+    dbf = gpd.read_file(DBF_PATH)
+    dbf = dbf[dbf["POA_CODE21"].str.match(QLD_RE, na=False)][
+        ["POA_CODE21", "POA_NAME21", "AREASQKM21"]
+    ].copy()
 
-    gdf = gpd.read_file(shp)
-    if gdf.crs is None:
-        gdf = gdf.set_crs("EPSG:7844")
-    elif gdf.crs.to_epsg() not in (7844, 4283):
-        gdf = gdf.set_crs("EPSG:7844", allow_override=True)
+    # Use SEIFA postcodes as the master list so we only show what has data
+    codes = set(df_seifa["POA_CODE_2021"])
+    dbf = dbf[dbf["POA_CODE21"].isin(codes)].copy()
 
-    gdf = gdf.to_crs("EPSG:4326")
-    gdf = gdf[gdf["POA_CODE21"].str.match(QLD_POSTCODE_RE, na=False)].copy()
-    gdf["geometry"] = gdf["geometry"].simplify(tolerance=0.001, preserve_topology=True)
-    return gdf[["POA_CODE21", "POA_NAME21", "AREASQKM21", "geometry"]].reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Synthetic geometry and employment (used when real data unavailable)
-# ---------------------------------------------------------------------------
-
-# (postcode, suburb, centre_lat, centre_lon, half_size_deg)
-_QLD_POSTCODES = [
-    ("4000", "Brisbane City",        -27.470, 153.025, 0.015),
-    ("4005", "New Farm",             -27.463, 153.042, 0.012),
-    ("4006", "Fortitude Valley",     -27.455, 153.032, 0.010),
-    ("4007", "Ascot",                -27.438, 153.060, 0.013),
-    ("4010", "Hamilton",             -27.440, 153.072, 0.012),
-    ("4011", "Clayfield",            -27.417, 153.072, 0.014),
-    ("4012", "Nundah",               -27.402, 153.073, 0.013),
-    ("4017", "Brighton",             -27.300, 153.052, 0.015),
-    ("4020", "Redcliffe",            -27.230, 153.102, 0.018),
-    ("4051", "Alderley",             -27.423, 152.988, 0.013),
-    ("4059", "Kelvin Grove",         -27.450, 152.990, 0.010),
-    ("4060", "Paddington",           -27.460, 153.000, 0.012),
-    ("4065", "Toowong",              -27.480, 152.982, 0.015),
-    ("4067", "St Lucia",             -27.502, 153.002, 0.013),
-    ("4069", "Kenmore",              -27.507, 152.940, 0.018),
-    ("4101", "South Brisbane",       -27.482, 153.018, 0.010),
-    ("4102", "Woolloongabba",        -27.493, 153.033, 0.012),
-    ("4105", "Moorooka",             -27.534, 153.008, 0.013),
-    ("4109", "Sunnybank",            -27.572, 153.051, 0.015),
-    ("4113", "Eight Mile Plains",    -27.578, 153.093, 0.015),
-    ("4120", "Greenslopes",          -27.495, 153.044, 0.012),
-    ("4122", "Mount Gravatt",        -27.542, 153.067, 0.016),
-    ("4151", "Coorparoo",            -27.493, 153.055, 0.013),
-    ("4153", "Capalaba",             -27.522, 153.197, 0.018),
-    ("4154", "Manly",                -27.460, 153.183, 0.016),
-    ("4160", "Cleveland",            -27.526, 153.278, 0.020),
-    ("4163", "Victoria Point",       -27.582, 153.299, 0.020),
-    ("4170", "Cannon Hill",          -27.473, 153.103, 0.015),
-    ("4114", "Logan Central",        -27.638, 153.107, 0.018),
-    ("4115", "Woodridge",            -27.641, 153.132, 0.016),
-    ("4127", "Springwood",           -27.608, 153.151, 0.018),
-    ("4128", "Forest Lake",          -27.618, 153.003, 0.018),
-    ("4205", "Beenleigh",            -27.713, 153.198, 0.018),
-    ("4207", "Coomera",              -27.874, 153.298, 0.022),
-    ("4209", "Ormeau",               -27.770, 153.272, 0.022),
-    ("4210", "Helensvale",           -27.932, 153.352, 0.020),
-    ("4211", "Nerang",               -27.980, 153.352, 0.020),
-    ("4212", "Runaway Bay",          -27.903, 153.402, 0.015),
-    ("4215", "Southport",            -27.960, 153.388, 0.016),
-    ("4216", "Surfers Paradise",     -28.003, 153.430, 0.012),
-    ("4217", "Broadbeach",           -28.030, 153.428, 0.012),
-    ("4220", "Burleigh Heads",       -28.092, 153.450, 0.015),
-    ("4223", "Currumbin",            -28.162, 153.491, 0.015),
-    ("4224", "Coolangatta",          -28.169, 153.540, 0.015),
-    ("4226", "Robina",               -28.067, 153.392, 0.020),
-    ("4270", "Tamborine Mountain",   -28.034, 153.192, 0.030),
-    ("4300", "Springfield",          -27.660, 152.920, 0.020),
-    ("4303", "Ipswich",              -27.610, 152.772, 0.022),
-    ("4305", "Bundamba",             -27.629, 152.808, 0.018),
-    ("4306", "Esk",                  -27.237, 152.422, 0.060),
-    ("4350", "Toowoomba",            -27.550, 151.952, 0.045),
-    ("4352", "Highfields",           -27.459, 151.955, 0.040),
-    ("4370", "Warwick",              -28.213, 152.037, 0.060),
-    ("4390", "Goondiwindi",          -28.550, 150.310, 0.100),
-    ("4400", "Dalby",                -27.183, 151.263, 0.070),
-    ("4405", "Miles",                -26.659, 150.183, 0.100),
-    ("4410", "Roma",                 -26.571, 148.793, 0.100),
-    ("4420", "Cunnamulla",           -28.068, 145.681, 0.200),
-    ("4500", "Strathpine",           -27.312, 153.042, 0.018),
-    ("4502", "Kallangur",            -27.270, 153.010, 0.018),
-    ("4504", "Burpengary",           -27.170, 153.003, 0.022),
-    ("4505", "Caboolture",           -27.074, 153.012, 0.025),
-    ("4507", "Bribie Island",        -27.040, 153.163, 0.025),
-    ("4508", "Narangba",             -27.202, 153.000, 0.020),
-    ("4509", "North Lakes",          -27.242, 153.020, 0.020),
-    ("4510", "Woodford",             -26.958, 152.780, 0.040),
-    ("4550", "Maleny",               -26.753, 152.853, 0.035),
-    ("4551", "Caloundra",            -26.800, 153.130, 0.025),
-    ("4552", "Beerwah",              -26.862, 153.000, 0.030),
-    ("4555", "Nambour",              -26.628, 152.959, 0.025),
-    ("4556", "Buderim",              -26.680, 153.062, 0.022),
-    ("4557", "Maroochydore",         -26.660, 153.100, 0.020),
-    ("4558", "Noosaville",           -26.397, 153.041, 0.022),
-    ("4560", "Cooroy",               -26.452, 152.907, 0.030),
-    ("4561", "Tewantin",             -26.402, 153.031, 0.020),
-    ("4567", "Noosa Heads",          -26.391, 153.098, 0.020),
-    ("4570", "Gympie",               -26.190, 152.667, 0.035),
-    ("4575", "Kawana Waters",        -26.722, 153.090, 0.018),
-    ("4580", "Maryborough",          -25.540, 152.700, 0.040),
-    ("4655", "Hervey Bay",           -25.290, 152.840, 0.040),
-    ("4670", "Bundaberg",            -24.870, 152.350, 0.045),
-    ("4680", "Gladstone",            -23.840, 151.260, 0.040),
-    ("4700", "Rockhampton",          -23.380, 150.510, 0.045),
-    ("4701", "Emerald",              -23.524, 148.168, 0.100),
-    ("4703", "Yeppoon",              -23.133, 150.743, 0.035),
-    ("4720", "Longreach",            -23.440, 144.252, 0.200),
-    ("4721", "Barcaldine",           -23.558, 145.290, 0.200),
-    ("4730", "Charleville",          -26.402, 146.242, 0.200),
-    ("4740", "Mackay",               -21.150, 149.190, 0.050),
-    ("4751", "Moranbah",             -22.003, 148.050, 0.060),
-    ("4800", "Bowen",                -20.012, 148.243, 0.060),
-    ("4802", "Airlie Beach",         -20.292, 148.703, 0.050),
-    ("4810", "Townsville",           -19.260, 146.820, 0.050),
-    ("4811", "Kirwan",               -19.322, 146.751, 0.035),
-    ("4814", "Hyde Park",            -19.307, 146.788, 0.030),
-    ("4817", "Garbutt",              -19.284, 146.764, 0.030),
-    ("4819", "Magnetic Island",      -19.139, 146.872, 0.040),
-    ("4820", "Charters Towers",      -20.074, 146.263, 0.080),
-    ("4825", "Mount Isa",            -20.730, 139.492, 0.150),
-    ("4830", "Cloncurry",            -20.710, 140.512, 0.150),
-    ("4850", "Ingham",               -18.650, 146.160, 0.060),
-    ("4869", "Innisfail",            -17.523, 146.028, 0.055),
-    ("4870", "Cairns",               -16.920, 145.770, 0.050),
-    ("4872", "Atherton",             -17.267, 145.477, 0.060),
-    ("4873", "Mossman",              -16.462, 145.372, 0.060),
-    ("4874", "Cooktown",             -15.468, 145.249, 0.100),
-    ("4875", "Weipa",                -12.661, 141.863, 0.150),
-    ("4880", "Mareeba",              -17.001, 145.428, 0.060),
-    ("4890", "Normanton",            -17.678, 141.078, 0.200),
-]
-
-_CENTROID_DICT = {poa: (lat, lon, h) for poa, _, lat, lon, h in _QLD_POSTCODES}
-_NAME_DICT = {poa: name for poa, name, *_ in _QLD_POSTCODES}
-
-
-def create_synthetic_boundaries(poa_codes: list[str]) -> gpd.GeoDataFrame:
-    """
-    Create approximate rectangular boundary polygons for QLD postcodes.
-    Only postcodes in the built-in centroid lookup are returned; others
-    are silently omitted (they would have highly inaccurate positions).
-    """
     records = []
-    for poa in poa_codes:
-        if poa not in _CENTROID_DICT:
-            continue
-        lat, lon, half = _CENTROID_DICT[poa]
-        geom = box(lon - half, lat - half * 0.7, lon + half, lat + half * 0.7)
-        area_km2 = round((half * 111) ** 2 * 2, 1)
+    for _, row in dbf.iterrows():
+        poa = row["POA_CODE21"]
+        lat, lon = _centroid(poa)
+        h = _half_size(float(row["AREASQKM21"]))
+        geom = box(lon - h, lat - h * 0.7, lon + h, lat + h * 0.7)
+        # Suburb name from lookup; DBF only stores the number
+        name = {p: n for p, n, *_ in [
+            ("4000","Brisbane City"),("4005","New Farm"),("4006","Fortitude Valley"),
+            ("4007","Ascot"),("4010","Hamilton"),("4011","Clayfield"),
+            ("4012","Nundah"),("4017","Brighton"),("4020","Redcliffe"),
+            ("4051","Alderley"),("4059","Kelvin Grove"),("4060","Paddington"),
+            ("4065","Toowong"),("4067","St Lucia"),("4069","Kenmore"),
+            ("4101","South Brisbane"),("4102","Woolloongabba"),("4105","Moorooka"),
+            ("4109","Sunnybank"),("4113","Eight Mile Plains"),("4120","Greenslopes"),
+            ("4122","Mount Gravatt"),("4151","Coorparoo"),("4153","Capalaba"),
+            ("4154","Manly"),("4160","Cleveland"),("4163","Victoria Point"),
+            ("4170","Cannon Hill"),("4114","Logan Central"),("4115","Woodridge"),
+            ("4127","Springwood"),("4128","Forest Lake"),("4205","Beenleigh"),
+            ("4207","Coomera"),("4209","Ormeau"),("4210","Helensvale"),
+            ("4211","Nerang"),("4212","Runaway Bay"),("4215","Southport"),
+            ("4216","Surfers Paradise"),("4217","Broadbeach"),("4220","Burleigh Heads"),
+            ("4223","Currumbin"),("4224","Coolangatta"),("4226","Robina"),
+            ("4270","Tamborine Mountain"),("4300","Springfield"),("4303","Ipswich"),
+            ("4305","Bundamba"),("4306","Esk"),("4350","Toowoomba"),
+            ("4370","Warwick"),("4390","Goondiwindi"),("4400","Dalby"),
+            ("4410","Roma"),("4420","Cunnamulla"),("4500","Strathpine"),
+            ("4502","Kallangur"),("4504","Burpengary"),("4505","Caboolture"),
+            ("4507","Bribie Island"),("4508","Narangba"),("4509","North Lakes"),
+            ("4510","Woodford"),("4550","Maleny"),("4551","Caloundra"),
+            ("4555","Nambour"),("4556","Buderim"),("4557","Maroochydore"),
+            ("4558","Noosaville"),("4567","Noosa Heads"),("4570","Gympie"),
+            ("4575","Kawana Waters"),("4580","Maryborough"),("4655","Hervey Bay"),
+            ("4670","Bundaberg"),("4680","Gladstone"),("4700","Rockhampton"),
+            ("4701","Emerald"),("4703","Yeppoon"),("4720","Longreach"),
+            ("4730","Charleville"),("4740","Mackay"),("4751","Moranbah"),
+            ("4800","Bowen"),("4802","Airlie Beach"),("4810","Townsville"),
+            ("4811","Kirwan"),("4814","Hyde Park"),("4817","Garbutt"),
+            ("4819","Magnetic Island"),("4820","Charters Towers"),
+            ("4825","Mount Isa"),("4830","Cloncurry"),("4850","Ingham"),
+            ("4869","Innisfail"),("4870","Cairns"),("4872","Atherton"),
+            ("4873","Mossman"),("4874","Cooktown"),("4875","Weipa"),
+            ("4880","Mareeba"),("4890","Normanton"),
+        ]}.get(poa, poa)
         records.append({
             "POA_CODE21": poa,
-            "POA_NAME21": _NAME_DICT.get(poa, poa),
-            "AREASQKM21": area_km2,
+            "POA_NAME21": name,
+            "AREASQKM21": round(float(row["AREASQKM21"]), 1),
             "geometry": geom,
         })
+
     gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
-    print(f"  Synthetic boundaries built for {len(gdf)} postcodes")
-    return gdf
-
-
-def generate_synthetic_employment(df_seifa: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Generate labour-force and medians tables correlated with real IRSD scores.
-    Useful when the Census DataPack is unavailable.
-    """
-    rng = np.random.default_rng(42)
-    poa_codes = df_seifa["POA_CODE_2021"].tolist()
-    irsd = df_seifa.set_index("POA_CODE_2021")["IRSD_DECILE_AUST"]
-
-    lf_rows, med_rows = [], []
-    for poa in poa_codes:
-        d = float(irsd.get(poa, 5))
-        unemp = float(np.clip(rng.normal(18 - d * 1.4, 2.5), 2.0, 25.0))
-        lf_tot = int(max(200, rng.normal(4000 if d >= 6 else 1500, 1000)))
-        lf_rows.append({
-            "POA_CODE_2021": poa,
-            "P_LF_Tot": lf_tot,
-            "P_Unemp_Tot": int(lf_tot * unemp / 100),
-            "unemployment_rate": round(unemp, 1),
-        })
-        med_rows.append({
-            "POA_CODE_2021": poa,
-            "Median_age_persons": int(np.clip(rng.normal(36 + d * 0.5, 4), 24, 55)),
-            "Median_tot_prsnl_inc_weekly": int(np.clip(rng.normal(600 + d * 70, 80), 300, 2000)),
-            "Median_rent_weekly": int(np.clip(rng.normal(350 + d * 25, 50), 150, 700)),
-            "Median_tot_hhd_inc_weekly": int(np.clip(rng.normal(960 + d * 110, 130), 500, 3500)),
-            "Average_household_size": round(float(rng.uniform(1.8, 3.2)), 1),
-        })
-    return pd.DataFrame(lf_rows), pd.DataFrame(med_rows)
-
-
-# ---------------------------------------------------------------------------
-# Full demo mode (no local files required)
-# ---------------------------------------------------------------------------
-
-def generate_full_demo() -> gpd.GeoDataFrame:
-    """Pure synthetic dataset — used when --demo is passed explicitly."""
-    rng = np.random.default_rng(42)
-    records = []
-    for poa, suburb, lat, lon, half in _QLD_POSTCODES:
-        dist = ((lat - (-27.47)) ** 2 + (lon - 153.02) ** 2) ** 0.5
-        coastal = max(0.0, 1.0 - abs(lon - 153.0) / 5.0)
-        base = 8.0 - dist * 1.8 + coastal * 2.0 + float(rng.normal(0, 1.2))
-        irsd_d = int(np.clip(round(base), 1, 10))
-        unemp = float(np.clip(rng.normal(18 - irsd_d * 1.4, 2.5), 2.0, 25.0))
-        lf = int(max(200, rng.normal(4000 if irsd_d >= 6 else 1500, 1000)))
-        inc = int(np.clip(rng.normal(600 + irsd_d * 70, 80), 300, 2000))
-        records.append({
-            "POA_CODE21": poa, "POA_NAME21": suburb,
-            "AREASQKM21": round((half * 111) ** 2 * 2, 1),
-            "geometry": box(lon - half, lat - half * 0.7, lon + half, lat + half * 0.7),
-            "IRSD_SCORE": 900 + (irsd_d - 5) * 30,
-            "IRSD_DECILE_AUST": irsd_d,
-            "IRSAD_SCORE": 900 + (irsd_d - 5) * 30 + int(rng.normal(0, 10)),
-            "IRSAD_DECILE_AUST": int(np.clip(irsd_d + int(rng.integers(-1, 2)), 1, 10)),
-            "IER_SCORE": 900 + (irsd_d - 5) * 30 + int(rng.normal(0, 20)),
-            "IER_DECILE_AUST": int(np.clip(irsd_d + int(rng.integers(-1, 2)), 1, 10)),
-            "IEO_SCORE": 900 + (irsd_d - 5) * 30 + int(rng.normal(0, 20)),
-            "IEO_DECILE_AUST": int(np.clip(irsd_d + int(rng.integers(-1, 2)), 1, 10)),
-            "USUAL_RESIDENT_POP": int(max(200, rng.normal(8000 if irsd_d >= 6 else 2000, 3000))),
-            "P_LF_Tot": lf, "P_Unemp_Tot": int(lf * unemp / 100),
-            "unemployment_rate": round(unemp, 1),
-            "Median_age_persons": int(np.clip(rng.normal(36 + irsd_d * 0.5, 4), 24, 55)),
-            "Median_tot_prsnl_inc_weekly": inc,
-            "Median_rent_weekly": int(np.clip(rng.normal(350 + irsd_d * 25, 50), 150, 700)),
-            "Median_tot_hhd_inc_weekly": int(inc * 1.6),
-            "Average_household_size": round(float(rng.uniform(1.8, 3.2)), 1),
-        })
-    gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
-    print(f"  Full demo dataset: {len(gdf)} synthetic postcodes")
+    print(f"  {len(gdf)} boundary features built")
     return gdf
 
 
@@ -474,7 +479,7 @@ def generate_full_demo() -> gpd.GeoDataFrame:
 # Merge
 # ---------------------------------------------------------------------------
 
-def merge_datasets(
+def merge_all(
     gdf: gpd.GeoDataFrame,
     df_seifa: pd.DataFrame,
     df_lf: pd.DataFrame,
@@ -489,37 +494,32 @@ def merge_datasets(
     gdf = _left(gdf, df_med)
 
     n, ns = len(gdf), int(gdf["IRSD_DECILE_AUST"].notna().sum())
-    print(f"  POA features in map: {n}")
-    print(f"  SEIFA matched:       {ns}/{n}")
-    if ns < n * 0.8:
-        print("  WARNING: low SEIFA match rate — check POA code format")
+    nu = int(gdf["unemployment_rate"].notna().sum())
+    print(f"  Merged: {n} features | SEIFA: {ns} | unemployment: {nu}")
     assert gdf.crs.to_epsg() == 4326
     return gdf
 
 
 # ---------------------------------------------------------------------------
-# Map builder
+# Map
 # ---------------------------------------------------------------------------
 
-def build_map(gdf: gpd.GeoDataFrame, note: str | None = None) -> folium.Map:
-    m = folium.Map(
-        location=[-22.0, 144.0],
-        zoom_start=5,
-        tiles="CartoDB positron",
-        prefer_canvas=True,
-    )
+def build_map(gdf: gpd.GeoDataFrame) -> folium.Map:
+    m = folium.Map(location=[-22.0, 144.0], zoom_start=5,
+                   tiles="CartoDB positron", prefer_canvas=True)
 
-    if note:
-        folium.map.Marker(
-            [-10.5, 138.5],
-            icon=folium.DivIcon(
-                html=(
-                    f'<div style="background:rgba(255,200,0,0.9);padding:6px 10px;'
-                    f'border-radius:4px;font-size:12px;white-space:nowrap;">{note}</div>'
-                ),
-                icon_size=(360, 36),
+    folium.map.Marker(
+        [-10.5, 138.0],
+        icon=folium.DivIcon(
+            html=(
+                '<div style="background:rgba(255,255,255,0.88);padding:6px 10px;'
+                'border-radius:4px;font-size:11px;border:1px solid #ccc;white-space:nowrap;">'
+                'Real ABS SEIFA 2021 &amp; Census DataPack data — '
+                'polygon boundaries are approximate (ABS .shp unavailable)</div>'
             ),
-        ).add_to(m)
+            icon_size=(470, 34),
+        ),
+    ).add_to(m)
 
     geojson_str = gdf.to_json()
 
@@ -540,16 +540,12 @@ def build_map(gdf: gpd.GeoDataFrame, note: str | None = None) -> folium.Map:
             show=layer["show"],
         )
         cp.add_to(m)
-
         present = [f for f in TOOLTIP_FIELDS if f in gdf.columns]
         aliases = [TOOLTIP_ALIASES[TOOLTIP_FIELDS.index(f)] for f in present]
-        cp.geojson.add_child(
-            folium.GeoJsonTooltip(
-                fields=present, aliases=aliases,
-                localize=True, sticky=False, labels=True,
-                style="font-size:12px;",
-            )
-        )
+        cp.geojson.add_child(folium.GeoJsonTooltip(
+            fields=present, aliases=aliases,
+            localize=True, sticky=False, labels=True, style="font-size:12px;",
+        ))
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -560,90 +556,24 @@ def build_map(gdf: gpd.GeoDataFrame, note: str | None = None) -> folium.Map:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build QLD Census 2021 postcode choropleth.")
-    parser.add_argument(
-        "--demo", action="store_true",
-        help="Skip all files and use fully synthetic data.",
-    )
-    args = parser.parse_args()
+    for path in (SEIFA_XLSX, DATAPACK_ZIP, DBF_PATH):
+        if not path.exists():
+            print(f"ERROR: required file not found: {path.name}", file=sys.stderr)
+            sys.exit(1)
+
     t0 = time.time()
+    df_seifa       = load_seifa()
+    df_lf, df_med  = load_datapack()
+    gdf            = build_boundaries(df_seifa)
+    gdf_final      = merge_all(gdf, df_seifa, df_lf, df_med)
 
-    if args.demo:
-        print("Demo mode — generating fully synthetic data ...")
-        gdf_final = generate_full_demo()
-        map_note = "⚠ Demo mode — fully synthetic data"
-    else:
-        # ---- SEIFA: use local file ----------------------------------------
-        if LOCAL_SEIFA.exists():
-            print(f"Loading SEIFA from local file: {LOCAL_SEIFA.name}")
-            df_seifa = load_seifa(LOCAL_SEIFA)
-        else:
-            print(f"Local SEIFA file not found ({LOCAL_SEIFA.name}); trying download ...")
-            try:
-                seifa_path = download_file(
-                    "https://www.abs.gov.au/statistics/people/people-and-communities/"
-                    "socio-economic-indexes-areas-seifa-australia/2021/"
-                    "Postal%20Area%2C%20Indexes%2C%20SEIFA%202021.xlsx",
-                    SEIFA_DIR / "Postal_Area_Indexes_SEIFA_2021.xlsx",
-                )
-                df_seifa = load_seifa(seifa_path)
-            except RuntimeError as e:
-                print(f"  [!] Could not load SEIFA: {e}", file=sys.stderr)
-                print("  [!] Run with --demo for fully synthetic output.", file=sys.stderr)
-                sys.exit(1)
-
-        df_seifa_qld = df_seifa[df_seifa["POA_CODE_2021"].str.match(QLD_POSTCODE_RE, na=False)].copy()
-        print(f"  QLD postcodes in SEIFA: {len(df_seifa_qld)}")
-
-        # ---- Boundaries: try download, else synthetic ----------------------
-        use_synthetic_geom = False
-        try:
-            BOUNDARY_DIR.mkdir(parents=True, exist_ok=True)
-            print("Downloading POA boundaries ...")
-            boundary_zip = download_file(BOUNDARY_URL, BOUNDARY_DIR / "POA_2021_AUST_SHP_GDA2020.zip")
-            extract_dir = BOUNDARY_DIR / "POA_2021_AUST_GDA2020"
-            gdf = load_boundaries(boundary_zip, extract_dir)
-            print(f"  Real boundary features: {len(gdf)}")
-        except RuntimeError:
-            print("  [!] Boundary download unavailable — using approximate rectangular polygons.")
-            use_synthetic_geom = True
-            gdf = create_synthetic_boundaries(df_seifa_qld["POA_CODE_2021"].tolist())
-
-        # ---- Employment: try download, else synthetic ----------------------
-        use_synthetic_emp = False
-        try:
-            DATAPACK_DIR.mkdir(parents=True, exist_ok=True)
-            print("Downloading Census DataPack (QLD POA) ...")
-            datapack_zip = download_file(DATAPACK_URL, DATAPACK_DIR / "2021_GCP_POA_for_QLD_short-header.zip")
-            g17a, g02 = extract_datapack_csvs(datapack_zip, DATAPACK_DIR)
-            df_lf = load_labour_force(g17a)
-            df_med = load_medians(g02)
-            print(f"  Real DataPack rows: {len(df_lf)}")
-        except RuntimeError:
-            print("  [!] DataPack download unavailable — generating synthetic employment data.")
-            use_synthetic_emp = True
-            df_lf, df_med = generate_synthetic_employment(df_seifa_qld)
-
-        print("Merging datasets ...")
-        gdf_final = merge_datasets(gdf, df_seifa_qld, df_lf, df_med)
-
-        parts = []
-        if use_synthetic_geom:
-            parts.append("approximate boundaries")
-        if use_synthetic_emp:
-            parts.append("synthetic employment")
-        map_note = ("ℹ Real SEIFA 2021 data — " + ", ".join(parts)) if parts else None
-
-    print("Building map ...")
-    m = build_map(gdf_final, note=map_note)
+    print("Building map …")
+    m = build_map(gdf_final)
     m.save(str(OUTPUT_HTML))
 
-    elapsed = time.time() - t0
     print(f"\nDone!  {OUTPUT_HTML}")
     print(f"Size:  {OUTPUT_HTML.stat().st_size / 1e6:.1f} MB")
-    print(f"Time:  {elapsed:.1f}s")
-    if map_note:
-        print(f"Note:  {map_note}")
+    print(f"Time:  {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":
