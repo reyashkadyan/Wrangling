@@ -53,30 +53,11 @@ SEIFA_COLS = [
 # Map layer config
 # ---------------------------------------------------------------------------
 
-LAYERS = [
-    dict(name="IRSD Decile (Socio-economic Disadvantage)",
-         col="IRSD_DECILE_AUST", palette="RdYlGn",
-         legend="IRSD Decile (1 = Most Disadvantaged, 10 = Least)", show=True),
-    dict(name="Unemployment Rate (%)",
-         col="unemployment_rate", palette="YlOrRd",
-         legend="Unemployment Rate (%)", show=False),
-    dict(name="Median Personal Income ($/week)",
-         col="Median_tot_prsnl_inc_weekly", palette="Blues",
-         legend="Median Personal Income ($/week)", show=False),
-]
-
-TOOLTIP_FIELDS = [
-    "POA_CODE21", "POA_NAME21",
-    "IRSD_DECILE_AUST", "IRSAD_DECILE_AUST",
-    "unemployment_rate", "Median_tot_prsnl_inc_weekly",
-    "Median_age_persons", "USUAL_RESIDENT_POP", "AREASQKM21",
-]
-TOOLTIP_ALIASES = [
-    "Postcode:", "Suburb:",
-    "IRSD Decile:", "IRSAD Decile:",
-    "Unemployment %:", "Median Income ($/wk):",
-    "Median Age:", "Population:", "Area (km²):",
-]
+# RdYlGn colours for IRSD deciles 1-10 (red = most disadvantaged, green = least)
+_IRSD_COLOURS = {
+    1: "#d73027", 2: "#f46d43", 3: "#fdae61", 4: "#fee08b", 5: "#ffffbf",
+    6: "#d9ef8b", 7: "#a6d96a", 8: "#66bd63", 9: "#1a9850", 10: "#006837",
+}
 
 # ---------------------------------------------------------------------------
 # Postcode centroid lookup  (lat, lon)
@@ -504,48 +485,123 @@ def merge_all(
 # Map
 # ---------------------------------------------------------------------------
 
+def _popup_html(row: pd.Series) -> str:
+    def _fmt(val, fmt="{}", suffix=""):
+        return (fmt.format(val) + suffix) if pd.notna(val) else "—"
+
+    irsd_d = int(row["IRSD_DECILE_AUST"]) if pd.notna(row.get("IRSD_DECILE_AUST")) else None
+    colour = _IRSD_COLOURS.get(irsd_d, "#aaa") if irsd_d else "#aaa"
+
+    name = row["POA_NAME21"]
+    code = row["POA_CODE21"]
+    title = name if name != code else f"Postcode {code}"
+
+    rows = [
+        ("Postcode",            code),
+        ("IRSD Decile",         _fmt(irsd_d) + (" / 10" if irsd_d else "")),
+        ("IRSAD Decile",        _fmt(row.get("IRSAD_DECILE_AUST")) + " / 10"),
+        ("Unemployment",        _fmt(row.get("unemployment_rate"), "{:.1f}", "%")),
+        ("Median income",       _fmt(row.get("Median_tot_prsnl_inc_weekly"), "${:,.0f}", "/wk")),
+        ("Median rent",         _fmt(row.get("Median_rent_weekly"), "${:,.0f}", "/wk")),
+        ("Median age",          _fmt(row.get("Median_age_persons"), "{:.0f}", " yrs")),
+        ("Population",          _fmt(row.get("USUAL_RESIDENT_POP"), "{:,.0f}")),
+        ("Area",                _fmt(row.get("AREASQKM21"), "{:,.1f}", " km²")),
+    ]
+
+    table_rows = "".join(
+        f'<tr><td style="color:#666;padding:2px 8px 2px 0">{label}</td>'
+        f'<td style="font-weight:600;text-align:right">{value}</td></tr>'
+        for label, value in rows
+    )
+
+    return (
+        f'<div style="font-family:Arial,sans-serif;min-width:210px">'
+        f'<div style="background:{colour};color:white;padding:7px 10px;border-radius:4px 4px 0 0;'
+        f'font-weight:bold;font-size:14px">{title}</div>'
+        f'<table style="width:100%;border-collapse:collapse;padding:6px">{table_rows}</table>'
+        f'</div>'
+    )
+
+
 def build_map(gdf: gpd.GeoDataFrame) -> folium.Map:
+    import branca.colormap as cm
+
     m = folium.Map(location=[-22.0, 144.0], zoom_start=5,
                    tiles="CartoDB positron", prefer_canvas=True)
 
-    folium.map.Marker(
-        [-10.5, 138.0],
-        icon=folium.DivIcon(
-            html=(
-                '<div style="background:rgba(255,255,255,0.88);padding:6px 10px;'
-                'border-radius:4px;font-size:11px;border:1px solid #ccc;white-space:nowrap;">'
-                'Real ABS SEIFA 2021 &amp; Census DataPack data — '
-                'polygon boundaries are approximate (ABS .shp unavailable)</div>'
-            ),
-            icon_size=(470, 34),
-        ),
-    ).add_to(m)
+    # Three switchable layers — one colour metric each
+    fg_irsd  = folium.FeatureGroup(name="IRSD Decile (Disadvantage) — colour", show=True)
+    fg_unemp = folium.FeatureGroup(name="Unemployment Rate % — colour", show=False)
+    fg_inc   = folium.FeatureGroup(name="Median Income $/week — colour", show=False)
 
-    geojson_str = gdf.to_json()
+    unemp_vals = gdf["unemployment_rate"].dropna()
+    inc_vals   = gdf["Median_tot_prsnl_inc_weekly"].dropna()
 
-    for layer in LAYERS:
-        valid = gdf[["POA_CODE21", layer["col"]]].dropna()
-        cp = folium.Choropleth(
-            geo_data=geojson_str,
-            name=layer["name"],
-            data=valid,
-            columns=["POA_CODE21", layer["col"]],
-            key_on="feature.properties.POA_CODE21",
-            fill_color=layer["palette"],
-            fill_opacity=0.7,
-            line_opacity=0.2,
-            legend_name=layer["legend"],
-            nan_fill_color="lightgrey",
-            nan_fill_opacity=0.3,
-            show=layer["show"],
+    unemp_cmap = cm.LinearColormap(
+        ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
+        vmin=unemp_vals.quantile(0.05), vmax=unemp_vals.quantile(0.95),
+        caption="Unemployment Rate (%)",
+    )
+    inc_cmap = cm.LinearColormap(
+        ["#eff3ff", "#bdd7e7", "#6baed6", "#2171b5", "#084594"],
+        vmin=inc_vals.quantile(0.05), vmax=inc_vals.quantile(0.95),
+        caption="Median Personal Income ($/week)",
+    )
+
+    for _, row in gdf.iterrows():
+        lat = row.geometry.centroid.y
+        lon = row.geometry.centroid.x
+        popup = folium.Popup(_popup_html(row), max_width=260)
+        tip   = f"{row['POA_NAME21']} ({row['POA_CODE21']})"
+
+        irsd_d = row.get("IRSD_DECILE_AUST")
+        irsd_colour = _IRSD_COLOURS.get(int(irsd_d), "#aaa") if pd.notna(irsd_d) else "#aaa"
+
+        unemp = row.get("unemployment_rate")
+        unemp_colour = unemp_cmap(unemp) if pd.notna(unemp) else "#aaa"
+
+        inc = row.get("Median_tot_prsnl_inc_weekly")
+        inc_colour = inc_cmap(inc) if pd.notna(inc) else "#aaa"
+
+        def _marker(colour):
+            return folium.CircleMarker(
+                location=[lat, lon],
+                radius=6,
+                color="white",
+                weight=0.8,
+                fill=True,
+                fill_color=colour,
+                fill_opacity=0.85,
+                popup=popup,
+                tooltip=tip,
+            )
+
+        _marker(irsd_colour).add_to(fg_irsd)
+        _marker(unemp_colour).add_to(fg_unemp)
+        _marker(inc_colour).add_to(fg_inc)
+
+    fg_irsd.add_to(m)
+    fg_unemp.add_to(m)
+    fg_inc.add_to(m)
+    unemp_cmap.add_to(m)
+    inc_cmap.add_to(m)
+
+    # IRSD legend (manual, since branca LinearColormap needs numeric input)
+    legend_html = (
+        '<div style="position:fixed;bottom:30px;left:30px;z-index:1000;'
+        'background:white;padding:10px 14px;border-radius:6px;'
+        'border:1px solid #ccc;font-family:Arial,sans-serif;font-size:12px">'
+        '<b>IRSD Decile</b><br>'
+        '<span style="color:#888;font-size:10px">1 = Most disadvantaged</span><br>'
+    )
+    for d, c in sorted(_IRSD_COLOURS.items()):
+        legend_html += (
+            f'<span style="display:inline-block;width:16px;height:16px;'
+            f'background:{c};border-radius:50%;margin:2px 4px 0 0;vertical-align:middle"></span>'
+            f'Decile {d}<br>'
         )
-        cp.add_to(m)
-        present = [f for f in TOOLTIP_FIELDS if f in gdf.columns]
-        aliases = [TOOLTIP_ALIASES[TOOLTIP_FIELDS.index(f)] for f in present]
-        cp.geojson.add_child(folium.GeoJsonTooltip(
-            fields=present, aliases=aliases,
-            localize=True, sticky=False, labels=True, style="font-size:12px;",
-        ))
+    legend_html += '</div>'
+    m.get_root().html.add_child(folium.Element(legend_html))
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
