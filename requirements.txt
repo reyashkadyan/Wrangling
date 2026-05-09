@@ -1,0 +1,7 @@
+pandas>=2.0
+geopandas>=0.14
+folium>=0.15
+requests>=2.28
+openpyxl>=3.1
+shapely>=2.0
+numpy>=1.24
